@@ -134,9 +134,19 @@ class PersonalAgent:
             role = message.get("role")
 
             if role == "user":
+                content = message.get("content") or ""
+                # Мультимедиа-сообщения сохраняются как JSON-список контента
+                # (например, текст + image_url). Восстанавливаем их структуру.
+                if isinstance(content, str) and content.strip().startswith("["):
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, list):
+                            content = parsed
+                    except (ValueError, TypeError):
+                        pass
                 result.append({
                     "role": "user",
-                    "content": message.get("content") or "",
+                    "content": content,
                 })
                 i += 1
                 continue
@@ -287,6 +297,7 @@ class PersonalAgent:
                 ensure_ascii=False,
             )
             event_payload = {"name": name, "error": str(exc)}
+            result = None
 
             if on_event and not announced:
                 on_event(
@@ -311,6 +322,7 @@ class PersonalAgent:
             "tool_call_id": call_id,
             "name": name,
             "content": result_text,
+            "multimedia_content": result.get("content") if isinstance(result, dict) else None,
         }
     
 
@@ -444,14 +456,33 @@ class PersonalAgent:
                     on_event,
                 )
 
-                # Добавляем результат в контекст текущего запроса.
-                messages.append(tool_message)
+                name = tool_message["name"]
 
-                # Сохраняем результат в историю сессии.
-                self.memory.add_message(
-                    session_id=sid,
-                    role="tool",
-                    content=tool_message["content"],
-                    tool_call_id=tool_message["tool_call_id"],
-                    name=tool_message["name"],
-                )
+                # Для open добавляем изображение как пользовательское
+                # мультимедиа-сообщение, чтобы модель могла увидеть его в следующем шаге.
+                if name == "open" and tool_message.get("multimedia_content"):
+                    multimedia_message = {
+                        "role": "user",
+                        "content": tool_message["multimedia_content"],
+                    }
+                    messages.append(multimedia_message)
+
+                    self.memory.add_message(
+                        session_id=sid,
+                        role="user",
+                        content=json.dumps(
+                            tool_message["multimedia_content"], ensure_ascii=False
+                        ),
+                    )
+                else:
+                    # Добавляем результат в контекст текущего запроса.
+                    messages.append(tool_message)
+
+                    # Сохраняем результат в историю сессии.
+                    self.memory.add_message(
+                        session_id=sid,
+                        role="tool",
+                        content=tool_message["content"],
+                        tool_call_id=tool_message["tool_call_id"],
+                        name=tool_message["name"],
+                    )
