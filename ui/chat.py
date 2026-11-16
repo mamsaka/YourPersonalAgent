@@ -34,6 +34,8 @@ class ChatView(tk.Frame):
         self._pad = theme.px(32)
         self._jump_visible = False
         self.welcome_visible = False
+        self._on_rollback: Callable[[int, str], None] | None = None
+        self._on_regenerate: Callable[[int], None] | None = None
 
         self.text = tk.Text(
             self, wrap="word", state="disabled", takefocus=True, undo=False,
@@ -254,7 +256,15 @@ class ChatView(tk.Frame):
 
     # ------------------------------ сообщения ------------------------------
 
-    def add_message(self, role: str, text: str):
+    def set_message_actions(
+        self,
+        on_rollback: Callable[[int, str], None] | None = None,
+        on_regenerate: Callable[[int], None] | None = None,
+    ) -> None:
+        self._on_rollback = on_rollback
+        self._on_regenerate = on_regenerate
+
+    def add_message(self, role: str, text: str, message_id: int | None = None):
         role = role if role in ROLE_TITLES else "assistant"
         text = str(text)
         self._counter += 1
@@ -267,6 +277,7 @@ class ChatView(tk.Frame):
             self._end_write()
             return None
         self._block_gap(rule=(role == "user"))
+        message_start = self.text.index("end-1c")
         self._put(f"●  {ROLE_TITLES[role]}", "hdr", f"hdr_{role}")
         if role == "assistant":
             self._raw[number] = text
@@ -286,8 +297,65 @@ class ChatView(tk.Frame):
         else:
             self._put(text.rstrip("\n"), "body")
         self._put("\n", "body")
+        if message_id is not None and role in ("user", "assistant"):
+            message_tag = f"__chat_message_{number}"
+            self._card_tags.append(message_tag)
+            self.text.tag_add(message_tag, message_start, "end-1c")
+            self.text.tag_bind(
+                message_tag,
+                "<Button-3>",
+                lambda event, r=role, mid=int(message_id), value=text:
+                    self._show_message_menu(event, r, mid, value),
+            )
+            # На macOS контекстное меню обычно вызывается Control-click или средней кнопкой.
+            self.text.tag_bind(
+                message_tag,
+                "<Button-2>",
+                lambda event, r=role, mid=int(message_id), value=text:
+                    self._show_message_menu(event, r, mid, value),
+            )
+            self.text.tag_bind(
+                message_tag,
+                "<Control-Button-1>",
+                lambda event, r=role, mid=int(message_id), value=text:
+                    self._show_message_menu(event, r, mid, value),
+            )
+            self._hover_link(message_tag)
         self._end_write()
-        return None
+        return number
+
+    def _show_message_menu(self, event, role: str, message_id: int, text: str):
+        if self.text.tag_ranges("sel"):
+            return "break"
+        menu = tk.Menu(
+            self,
+            tearoff=0,
+            bg=self.theme.c["card"],
+            fg=self.theme.c["text"],
+            activebackground=self.theme.c["select"],
+            activeforeground=self.theme.c["text"],
+            borderwidth=0,
+        )
+        if role == "user" and self._on_rollback is not None:
+            menu.add_command(
+                label="Вернуться к этому сообщению",
+                command=lambda: self._on_rollback(message_id, text),
+            )
+        elif role == "assistant" and self._on_regenerate is not None:
+            menu.add_command(
+                label="Регенерировать ответ",
+                command=lambda: self._on_regenerate(message_id),
+            )
+        else:
+            return "break"
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+        return "break"
 
     def _copy_message(self, number: int) -> None:
         if self.text.tag_ranges("sel"):

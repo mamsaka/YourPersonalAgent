@@ -177,7 +177,7 @@ class MemoryStore:
         tool_call_id: str | None = None,
         name: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
-    ) -> None:
+    ) -> int:
         """
         Сохраняет сообщение.
 
@@ -198,7 +198,7 @@ class MemoryStore:
             )
 
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO messages(
                     session_id,
@@ -221,6 +221,7 @@ class MemoryStore:
                     self._now(),
                 ),
             )
+            return int(cur.lastrowid)
 
     def add_chat_message(
         self,
@@ -264,6 +265,7 @@ class MemoryStore:
 
         sql = """
             SELECT
+                id,
                 role,
                 content,
                 tool_call_id,
@@ -303,6 +305,7 @@ class MemoryStore:
 
         for row in rows:
             item: dict[str, Any] = {
+                "id": int(row["id"]),
                 "role": row["role"],
                 "content": row["content"],
             }
@@ -328,6 +331,35 @@ class MemoryStore:
             result.append(item)
 
         return result
+
+    def delete_messages_after(
+        self,
+        session_id: int,
+        message_id: int,
+        *,
+        include_message: bool = False,
+    ) -> int:
+        """Удаляет выбранное сообщение (опционально) и все сообщения после него."""
+        operator = ">=" if include_message else ">"
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"DELETE FROM messages WHERE session_id = ? AND id {operator} ?",
+                (session_id, int(message_id)),
+            )
+            return int(cur.rowcount)
+
+    def update_user_message(self, session_id: int, message_id: int, content: str) -> bool:
+        """Обновляет текст выбранного пользовательского сообщения."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE messages
+                SET content = ?, created_at = ?
+                WHERE id = ? AND session_id = ? AND role = 'user'
+                """,
+                (content, self._now(), int(message_id), session_id),
+            )
+            return cur.rowcount > 0
 
     def clear_session(self, session_id: int) -> None:
         with self._connect() as conn:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import copy
 import json
 import mimetypes
 import os
@@ -770,7 +771,34 @@ class ToolRegistry:
     # ------------------------------------------------------------------ вызовы
 
     def schemas(self) -> list[dict[str, Any]]:
-        return list(self._schemas.values())
+        """
+        Возвращает инструменты с информацией о соответствующих навыках.
+        Поддерживает встроенные и сгенерированные инструменты.
+        """
+        result = []
+
+        for name, original_schema in self._schemas.items():
+            schema = copy.deepcopy(original_schema)
+
+            # Проверяем наличие одноимённого навыка
+            skill_path = self.skills.root / name / "SKILL.md"
+
+            if skill_path.is_file():
+                schema["function"]["description"] += (
+                    f"\n\n"
+                    f"[ЕСТЬ СКИЛЛ: {name}]\n"
+                    f"Для этого инструмента существует специальный навык:\n"
+                    f"skills/{name}/SKILL.md\n\n"
+                    f"Перед использованием инструмента обязательно "
+                    f"прочитай этот навык через инструмент read_skill, "
+                    f"передав ему name=\"{name}\".\n"
+                    f"Следуй инструкциям навыка при использовании "
+                    f"этого инструмента."
+                )
+
+            result.append(schema)
+
+        return result
 
     def list_tool_names(self) -> list[str]:
         return sorted(self._handlers)

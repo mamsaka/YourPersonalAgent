@@ -127,6 +127,7 @@ class AgentApp(tk.Tk):
         self._busy_since = 0.0
         self._status_text = "Готов"
         self._status_kind = "muted"
+        self._editing_message_id: int | None = None
         self._ws = str(self.tk.call("tk", "windowingsystem"))
         self.current_session_id = self.memory.get_default_session_id()
         self.agent.set_session(self.current_session_id)
@@ -273,6 +274,7 @@ class AgentApp(tk.Tk):
         tk.Frame(main, bg=c["border"], height=1).grid(row=0, column=0, sticky="sew")
 
         self.chat = ChatView(main, th)
+        self.chat.set_message_actions(self._rollback_to_message, self._regenerate_message)
         self.chat.grid(row=1, column=0, sticky="nsew")
 
         # ------------------------------ поле ввода ------------------------------
@@ -552,6 +554,7 @@ class AgentApp(tk.Tk):
         self._switch_session(session_id)
 
     def _switch_session(self, session_id: int) -> None:
+        self._editing_message_id = None
         self.current_session_id = session_id
         self.agent.set_session(session_id)
         self._refresh_sessions(select=session_id)
@@ -620,8 +623,10 @@ class AgentApp(tk.Tk):
             self.chat.add_message("system", f"Показаны последние {MAX_RENDERED_MESSAGES} записей, ещё {hidden} скрыто (они остаются в базе).")
         for row in rows[hidden:]:
             role = row["role"]
-            if role in ("user", "assistant"):
-                self.chat.add_message(role, row["content"])
+            if role == "user":
+                self.chat.add_message(role, row["content"], message_id=row.get("id"))
+            elif role == "assistant" and row.get("content") is not None and not row.get("tool_calls"):
+                self.chat.add_message(role, row["content"], message_id=row.get("id"))
             elif role == "tool":
                 self.chat.add_tool_history(row.get("name") or "tool", row["content"])
         if not rows:
@@ -630,6 +635,78 @@ class AgentApp(tk.Tk):
                 notices.append(("Сначала добавь OpenRouter API key — нажми здесь, чтобы открыть настройки.", self._open_settings))
             self.chat.show_welcome(WELCOME_TITLE, WELCOME_SUBTITLE, SUGGESTIONS, 4, self._use_suggestion, notices)
         self.chat.scroll_to_bottom(force=True)
+
+    def _rollback_to_message(self, message_id: int, original_text: str) -> None:
+        """Оставить историю до выбранного запроса и открыть его для редактирования."""
+        if self.busy:
+            self._set_status("Сначала останови или дождись завершения текущего ответа.", "warn")
+            return
+        rows = self.memory.get_session_messages(self.current_session_id)
+        selected = next((row for row in rows if row.get("id") == message_id), None)
+        if selected is None or selected.get("role") != "user":
+            self._set_status("Не удалось найти выбранное сообщение.", "warn")
+            return
+        prompt = str(selected.get("content") or original_text)
+        later_count = sum(1 for row in rows if row.get("id", 0) > message_id)
+        if later_count and not messagebox.askyesno(
+            "Вернуться к сообщению",
+            "Все сообщения после выбранного будут удалены. Сам запрос останется в истории "
+            "и загрузится в поле ввода для редактирования. Продолжить?",
+            parent=self,
+        ):
+            return
+
+        self.memory.delete_messages_after(self.current_session_id, message_id)
+        self._editing_message_id = message_id
+        self._render_history()
+        self.input.delete("1.0", "end")
+        self.input.insert("1.0", prompt)
+        self._on_input_change()
+        self.input.focus_set()
+        self._set_status("Запрос восстановлен: отредактируй его или отправь без изменений.", "ok")
+
+    def _regenerate_message(self, message_id: int) -> None:
+        """Удалить выбранный ответ и всё после него, затем повторить запрос к модели."""
+        if self.busy:
+            self._set_status("Сначала останови или дождись завершения текущего ответа.", "warn")
+            return
+        if not self.client.api_key:
+            self.chat.add_message("error", "Сначала укажи OpenRouter API key (Настройки → API key).")
+            return
+
+        rows = self.memory.get_session_messages(self.current_session_id)
+        selected_index = next(
+            (index for index, row in enumerate(rows) if row.get("id") == message_id),
+            None,
+        )
+        if selected_index is None or rows[selected_index].get("role") != "assistant":
+            self._set_status("Не удалось найти выбранный ответ.", "warn")
+            return
+        selected = rows[selected_index]
+        if selected.get("tool_calls") or not selected.get("content"):
+            self._set_status("Этот элемент не является готовым ответом модели.", "warn")
+            return
+        previous_user = next(
+            (row for row in reversed(rows[:selected_index]) if row.get("role") == "user"),
+            None,
+        )
+        if previous_user is None:
+            self._set_status("Для этого ответа не найден исходный запрос.", "warn")
+            return
+
+        if not messagebox.askyesno(
+            "Регенерировать ответ",
+            "Выбранный ответ и все последующие сообщения будут удалены, после чего модель "
+            "ответит на исходный запрос заново. Уже выполненные действия инструментов "
+            "(например, изменение файлов) не отменяются. Продолжить?",
+            parent=self,
+        ):
+            return
+
+        self.memory.delete_messages_after(self.current_session_id, int(previous_user["id"]))
+        self._editing_message_id = None
+        self._render_history()
+        self._start_agent_run(str(previous_user.get("content") or ""), self.current_session_id)
 
     # ------------------------------------------------------------------ отправка и остановка
 
@@ -683,15 +760,37 @@ class AgentApp(tk.Tk):
             return
         if self.chat.welcome_visible:
             self.chat.clear()
-        self.input.delete("1.0", "end")
-        self._on_input_change()
         self._model_changed()
         session_id = self.current_session_id
         if self.memory.get_session_name(session_id) == DEFAULT_SESSION_NAME:
             title = " ".join(text.split())
             self.memory.rename_session(session_id, title[:40] + ("…" if len(title) > 40 else ""))
             self._refresh_sessions(select=session_id)
-        self.chat.add_message("user", text)
+
+        # Сохраняем запрос до запуска фонового потока: его DB ID нужен для контекстного меню.
+        if self._editing_message_id is not None:
+            message_id = self._editing_message_id
+            if not self.memory.update_user_message(session_id, message_id, text):
+                self._editing_message_id = None
+                self._set_status("Не удалось обновить исходное сообщение. Отправь его ещё раз.", "danger")
+                return
+            self.memory.delete_messages_after(session_id, message_id)
+            self._editing_message_id = None
+            self._render_history()
+        else:
+            message_id = self.memory.add_message(session_id, "user", text)
+            self.chat.add_message("user", text, message_id=message_id)
+
+        self.input.delete("1.0", "end")
+        self._on_input_change()
+        self._start_agent_run(text, session_id)
+
+    def _start_agent_run(self, text: str, session_id: int) -> None:
+        """Запускает модель с уже сохранённым в истории пользовательским запросом."""
+        if self.busy:
+            self._set_status("Агент ещё работает — дождись ответа или нажми Esc.", "warn")
+            return
+        assert self.chat is not None
         self.chat.scroll_to_bottom(force=True)
         self._busy_since = time.monotonic()
         self._status_text, self._status_kind = "Агент работает…", "muted"
@@ -702,8 +801,26 @@ class AgentApp(tk.Tk):
 
         def worker() -> None:
             try:
-                answer = self.agent.run(text, on_event=on_event, session_id=session_id)
-                self.events.put(("answer", answer))
+                answer = self.agent.run(
+                    text,
+                    on_event=on_event,
+                    session_id=session_id,
+                    save_user_message=False,
+                )
+                history = self.memory.get_session_messages(session_id)
+                final_row = next(
+                    (
+                        row for row in reversed(history)
+                        if row.get("role") == "assistant"
+                        and row.get("content") is not None
+                        and not row.get("tool_calls")
+                    ),
+                    None,
+                )
+                self.events.put(("answer", {
+                    "text": answer,
+                    "message_id": final_row.get("id") if final_row else None,
+                }))
             except AgentCancelled as exc:
                 self.events.put(("cancelled", str(exc)))
             except (AgentError, OpenRouterError) as exc:
@@ -780,7 +897,12 @@ class AgentApp(tk.Tk):
         elif kind == "warning":
             self.chat.add_message("system", str(payload))
         elif kind == "answer":
-            self.chat.add_message("assistant", str(payload))
+            if isinstance(payload, dict):
+                answer_text = str(payload.get("text", ""))
+                message_id = payload.get("message_id")
+            else:  # совместимость с очередью событий старого формата
+                answer_text, message_id = str(payload), None
+            self.chat.add_message("assistant", answer_text, message_id=message_id)
             self._status_text, self._status_kind = "Готов", "ok"
             self._finish_run()
         elif kind == "cancelled":
