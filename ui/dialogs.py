@@ -262,7 +262,8 @@ class PersonaDialog(Dialog):
             return "neutral"
         lowered = self._current.lower()
         for key, (name, desc) in self._personas.items():
-            if lowered in (key.lower(), name.lower()) or self._current == desc:
+            flat = " ".join(desc.split())
+            if lowered in (key.lower(), name.lower()) or self._current == flat:
                 return key
         return self.CUSTOM
 
