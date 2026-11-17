@@ -12,7 +12,7 @@ from typing import Any
 
 from core import browser as browser_module
 from core import terminals as terminals_module
-from core.agent import PERSONAS, AgentCancelled, AgentError, PersonalAgent
+from core.agent import PERSONAS, AgentCancelled, AgentError, PersonalAgent, resolve_persona
 from core.config import APP_DATA, ENV_FILE, UI_SETTINGS_FILE, AgentConfig, env_has, is_valid_geometry
 from core.memory import MemoryStore
 from core.openrouter import OpenRouterClient, OpenRouterError
@@ -560,10 +560,11 @@ class AgentApp(tk.Tk):
 
     def _save_persona(self, value: str) -> None:
         self.config_obj.save_persona(value)
-        label = value or "Нейтральный"
-        self._set_status(f"Характер: {label}", "ok")
+        label, _text = resolve_persona(value)
+        shown = label or f"свой текст, {len(value)} симв."
+        self._set_status(f"Характер: {shown}", "ok")
         if self.chat:
-            self.chat.add_message("system", f"Характер агента обновлён: {label}. Применяется со следующего запроса.")
+            self.chat.add_message("system", f"Характер агента обновлён: {shown}. Применяется со следующего запроса.")
 
     def _save_api_key(self, value: str) -> None:
         self.client.set_api_key(value)

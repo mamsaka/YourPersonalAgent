@@ -202,65 +202,55 @@ class PersonaDialog(Dialog):
 
     def __init__(self, parent, theme: Theme, personas: dict[str, tuple[str, str]], current: str,
                  on_save: Callable[[str], None]):
-        super().__init__(parent, theme, "Характер агента", 640, 620, modal=True, resizable=False)
+        super().__init__(parent, theme, "Характер агента", 720, 700, modal=True, resizable=True)
         c = theme.c
         self._personas = personas
         self._on_save = on_save
         self._current = " ".join(str(current or "").split()).strip()
+        self.minsize(theme.px(620), theme.px(560))
 
         wrap = tk.Frame(self, bg=c["panel"])
-        wrap.pack(fill="both", expand=True, padx=26, pady=20)
+        wrap.pack(fill="both", expand=True, padx=26, pady=(20, 0))
         _label(wrap, theme, "Характер агента", "title").pack(anchor="w", pady=(0, 4))
         tk.Label(wrap, text="Задаёт стиль общения модели. Правила безопасности и точность фактов он не меняет.",
-                 bg=c["panel"], fg=c["muted"], font=theme.font_small, wraplength=theme.px(560),
+                 bg=c["panel"], fg=c["muted"], font=theme.font_small, wraplength=theme.px(620),
                  justify="left").pack(anchor="w")
 
-        tk.Frame(wrap, bg=c["border"], height=1).pack(fill="x", pady=14)
+        tk.Frame(wrap, bg=c["border"], height=1).pack(fill="x", pady=12)
 
-        _label(wrap, theme, "ГОТОВЫЕ", "section").pack(anchor="w")
+        _label(wrap, theme, "ГОТОВЫЕ ХАРАКТЕРЫ", "section").pack(anchor="w")
         self.choice = tk.StringVar(value=self._detect_choice())
         grid = tk.Frame(wrap, bg=c["panel"])
         grid.pack(fill="x", pady=(8, 0))
-        for index, (key, (name, desc)) in enumerate(personas.items()):
-            row = tk.Frame(grid, bg=c["panel"])
-            row.grid(row=index, column=0, sticky="ew", pady=2)
-            grid.grid_columnconfigure(0, weight=1)
+        names = [(key, name) for key, (name, _desc) in personas.items()]
+        names.append((self.CUSTOM, self.CUSTOM))
+        for index, (key, name) in enumerate(names):
             tk.Radiobutton(
-                row, text=name, value=key, variable=self.choice, command=self._on_choice,
+                grid, text=name, value=key, variable=self.choice, command=self._on_choice,
                 bg=c["panel"], fg=c["text"], activebackground=c["panel"], activeforeground=c["text"],
                 selectcolor=c["card"], font=theme.font_ui_bold, anchor="w", highlightthickness=0, borderwidth=0,
-            ).pack(side="left")
-            tk.Label(row, text=desc, bg=c["panel"], fg=c["muted"], font=theme.font_small, anchor="w",
-                     justify="left", wraplength=theme.px(420)).pack(side="left", padx=(10, 0))
+            ).grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 18), pady=2)
 
-        row_custom = tk.Frame(grid, bg=c["panel"])
-        row_custom.grid(row=len(personas), column=0, sticky="ew", pady=(6, 0))
-        tk.Radiobutton(
-            row_custom, text=self.CUSTOM, value=self.CUSTOM, variable=self.choice, command=self._on_choice,
-            bg=c["panel"], fg=c["text"], activebackground=c["panel"], activeforeground=c["text"],
-            selectcolor=c["card"], font=theme.font_ui_bold, anchor="w", highlightthickness=0, borderwidth=0,
-        ).pack(side="left")
-        tk.Label(row_custom, text="Опишите характер словами ниже.", bg=c["panel"], fg=c["muted"],
-                 font=theme.font_small, anchor="w").pack(side="left", padx=(10, 0))
-
-        tk.Frame(wrap, bg=c["border"], height=1).pack(fill="x", pady=14)
+        tk.Frame(wrap, bg=c["border"], height=1).pack(fill="x", pady=12)
 
         head = tk.Frame(wrap, bg=c["panel"])
         head.pack(fill="x")
-        _label(head, theme, "СВОЙ ХАРАКТЕР", "section").pack(side="left")
+        self.section = tk.Label(head, text="ТЕКСТ ХАРАКТЕРА", bg=c["panel"], fg=c["muted"],
+                                font=theme.font_small_bold)
+        self.section.pack(side="left")
         self.counter = tk.Label(head, text="", bg=c["panel"], fg=c["muted"], font=theme.font_small)
         self.counter.pack(side="right")
-        self.text = ReadOnlyText(wrap, theme, bg=c["input_bg"], fg=c["text"], font=theme.font, height=8)
+
+        self.text = ReadOnlyText(wrap, theme, bg=c["input_bg"], fg=c["text"], font=theme.font, height=16)
         self.text.pack(fill="both", expand=True, pady=(6, 0))
-        self._enable_edit()
-        self.desc = tk.Label(wrap, text="Опишите стиль общения: тон, манеру, чего избегать.",
-                             bg=c["panel"], fg=c["muted"], font=theme.font_small, anchor="w",
-                             wraplength=theme.px(560), justify="left")
-        self.desc.pack(fill="x", pady=(6, 0))
         self.text.text.bind("<KeyRelease>", lambda e: self._refresh_counter(), add="+")
+        self.hint = tk.Label(wrap, text="", bg=c["panel"], fg=c["muted"], font=theme.font_small, anchor="w",
+                             wraplength=theme.px(640), justify="left")
+        self.hint.pack(fill="x", pady=(6, 0))
+        self._custom_text = self._current if self.choice.get() == self.CUSTOM else ""
 
         buttons = tk.Frame(self, bg=c["panel"])
-        buttons.pack(side="bottom", fill="x", padx=26, pady=18)
+        buttons.pack(side="bottom", fill="x", padx=26, pady=16)
         FlatButton(buttons, theme, "Сохранить", self._save, kind="accent", padx=20).pack(side="right")
         FlatButton(buttons, theme, "Сбросить", self._reset, kind="ghost", padx=16).pack(side="right", padx=(0, 8))
         FlatButton(buttons, theme, "Отмена", self.close, kind="ghost", padx=16).pack(side="right", padx=(0, 8))
@@ -270,23 +260,20 @@ class PersonaDialog(Dialog):
     def _detect_choice(self) -> str:
         if not self._current:
             return "neutral"
+        lowered = self._current.lower()
         for key, (name, desc) in self._personas.items():
-            if self._current == name or self._current == desc:
+            if lowered in (key.lower(), name.lower()) or self._current == desc:
                 return key
-        # В .env может оказаться и имя, и описание; иначе это свой текст.
         return self.CUSTOM
 
-    def _enable_edit(self) -> None:
-        self.text.text.configure(state="normal")
-        self.text.text.delete("1.0", "end")
-        self.text.text.insert("1.0", self._current)
-        self._refresh_counter()
-
-    def _choice_text(self) -> str:
-        key = self.choice.get()
-        if key == self.CUSTOM:
-            return self.text.text.get("1.0", "end-1c")
-        return self._personas.get(key, ("", ""))[1]
+    def _set_preview(self, value: str, editable: bool) -> None:
+        try:
+            self.text.text.configure(state="normal")
+            self.text.text.delete("1.0", "end")
+            self.text.text.insert("1.0", value)
+            self.text.text.configure(state="normal" if editable else "disabled")
+        except tk.TclError:
+            pass
 
     def _refresh_counter(self) -> None:
         used = len(self.text.text.get("1.0", "end-1c").strip())
@@ -294,29 +281,33 @@ class PersonaDialog(Dialog):
                                fg=self.theme.c["danger"] if used > PERSONA_MAX_CHARS else self.theme.c["muted"])
 
     def _on_choice(self) -> None:
-        custom = self.choice.get() == self.CUSTOM
-        try:
-            self.text.text.configure(state="normal" if custom else "disabled")
-            if not custom:
-                self.text.text.configure(state="normal")
-                self.text.text.delete("1.0", "end")
-                self.text.text.insert("1.0", self._choice_text())
-                self.text.text.configure(state="disabled")
-        except tk.TclError:
-            pass
+        key = self.choice.get()
+        custom = key == self.CUSTOM
+        if custom:
+            self._set_preview(self._custom_text, True)
+            self.section.configure(text="СВОЙ ХАРАКТЕР")
+            self.hint.configure(text="Опишите стиль общения: тон, манеру, обращения, чего избегать. "
+                                     "Текст уходит в системный промпт как есть.")
+        else:
+            name, desc = self._personas.get(key, ("", ""))
+            self._set_preview(desc, False)
+            self.section.configure(text=f"ХАРАКТЕР «{name.upper()}»")
+            self.hint.configure(text="Этот текст отправляется модели как есть. Выберите «Свой вариант», "
+                                     "чтобы написать собственный.")
         self._refresh_counter()
 
     def _reset(self) -> None:
         self.choice.set("neutral")
-        self._current = ""
-        self._enable_edit()
+        self._custom_text = ""
         self._on_choice()
 
     def _save(self) -> None:
         key = self.choice.get()
-        value = self._choice_text()
-        if key != self.CUSTOM:
-            # Для готовых характеров сохраняем название, чтобы .env читался человеком.
+        if key == self.CUSTOM:
+            value = self.text.text.get("1.0", "end-1c")
+        else:
+            # Для готовых характеров сохраняем название: в .env читается человеком,
+            # а полный текст подставляется из PERSONAS при сборке промпта.
             value = self._personas.get(key, ("neutral", ""))[0]
         value = " ".join(str(value).split()).strip()[:PERSONA_MAX_CHARS]
         self.close()
