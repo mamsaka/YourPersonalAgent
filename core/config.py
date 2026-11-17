@@ -15,6 +15,9 @@ BACKUPS_DIR = APP_DATA / "backups"
 ENV_FILE = ROOT / ".env"
 UI_SETTINGS_FILE = APP_DATA / "ui_settings.json"
 
+# Максимальная длина характера агента в символах.
+PERSONA_MAX_CHARS = 10_000
+
 # WxH  или  WxH+X+Y (позиция может быть отрицательной — второй монитор).
 _GEOMETRY_RE = re.compile(r"^\d+x\d+([+-]\d+[+-]\d+)?$")
 
@@ -58,6 +61,62 @@ def _write_env_file(updates: dict[str, str]) -> None:
 
 def _setting(env: dict[str, str], name: str, default: str) -> str:
     return os.getenv(name, env.get(name, default))
+
+
+def tidy_persona(text: str) -> str:
+    """Привести характер к аккуратному виду: без хвостовых пробелов и лишних пустых строк, абзацы сохраняются."""
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out: list[str] = []
+    blanks = 0
+    for line in lines:
+        line = line.rstrip()
+        if line.strip():
+            blanks = 0
+            out.append(line)
+        else:
+            blanks += 1
+            if blanks <= 1:  # между абзацами оставляем ровно одну пустую строку
+                out.append("")
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out)
+
+
+def escape_env_value(value: str) -> str:
+    """Уложить многострочное значение в одну строку .env: переносы → \\n, обратный слэш → \\\\."""
+    return (str(value)
+            .replace("\\", "\\\\")
+            .replace("\r\n", "\\n")
+            .replace("\n", "\\n")
+            .replace("\r", "\\n"))
+
+
+def unescape_env_value(value: str) -> str:
+    """Вернуть переносы строк из значения .env. Обрабатывает \\\\, \\n и \\r одним проходом."""
+    text = str(value)
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == "\\" and i + 1 < len(text):
+            nxt = text[i + 1]
+            if nxt == "n":
+                out.append("\n")
+                i += 2
+                continue
+            if nxt == "r":
+                out.append("\n")
+                i += 2
+                continue
+            if nxt == "\\":
+                out.append("\\")
+                i += 2
+                continue
+        out.append(char)
+        i += 1
+    return "".join(out)
 
 
 def _int_setting(env: dict[str, str], name: str, default: int) -> int:
@@ -126,7 +185,7 @@ class AgentConfig:
             stream=_bool_setting(env, "OPENROUTER_STREAM", True),
             theme=_setting(env, "AGENT_THEME", cls.theme),
             api_key=_setting(env, "OPENROUTER_API_KEY", ""),
-            persona=_setting(env, "AGENT_PERSONA", ""),
+            persona=unescape_env_value(_setting(env, "AGENT_PERSONA", "")),
             last_session=_int_or_none(_setting(env, "AGENT_LAST_SESSION", "")),
             window_geometry=_setting(env, "AGENT_WINDOW_GEOMETRY", ""),
         )
@@ -171,8 +230,11 @@ class AgentConfig:
         _write_env_file({"AGENT_WINDOW_GEOMETRY": geometry})
 
     def save_persona(self, persona: str) -> None:
-        """Запомнить характер агента в .env. Пустая строка сбрасывает характер."""
-        # Многострочный характер храним в одну строку: \n экранируем.
-        flat = " ".join(persona.split()).strip()
-        self.persona = flat
-        _write_env_file({"AGENT_PERSONA": flat})
+        """Запомнить характер агента в .env. Пустая строка сбрасывает характер.
+
+        Текст хранится в одной строке файла: переносы строк экранируются как \\n
+        и восстанавливаются при чтении, поэтому абзацы не теряются.
+        """
+        text = tidy_persona(persona)[:PERSONA_MAX_CHARS]
+        self.persona = text
+        _write_env_file({"AGENT_PERSONA": escape_env_value(text)})

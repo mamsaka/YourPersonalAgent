@@ -9,6 +9,7 @@ from .theme import Theme
 from .widgets import (FlatButton, ReadOnlyText, Switch, clip, format_arguments, make_entry)
 
 from core.agent import PERSONAS, PERSONA_MAX_CHARS
+from core.config import tidy_persona
 
 
 class Dialog(tk.Toplevel):
@@ -206,7 +207,7 @@ class PersonaDialog(Dialog):
         c = theme.c
         self._personas = personas
         self._on_save = on_save
-        self._current = " ".join(str(current or "").split()).strip()
+        self._current = str(current or "").strip()
         self.minsize(theme.px(620), theme.px(560))
 
         wrap = tk.Frame(self, bg=c["panel"])
@@ -258,12 +259,11 @@ class PersonaDialog(Dialog):
         self.ready()
 
     def _detect_choice(self) -> str:
-        if not self._current:
+        if not self._current.strip():
             return "neutral"
-        lowered = self._current.lower()
+        flat = " ".join(self._current.split()).lower()
         for key, (name, desc) in self._personas.items():
-            flat = " ".join(desc.split())
-            if lowered in (key.lower(), name.lower()) or self._current == flat:
+            if flat in (key.lower(), name.lower()) or flat == " ".join(desc.split()).lower():
                 return key
         return self.CUSTOM
 
@@ -284,6 +284,9 @@ class PersonaDialog(Dialog):
     def _on_choice(self) -> None:
         key = self.choice.get()
         custom = key == self.CUSTOM
+        # Запоминаем правки, если поле было редактируемым: переключение не должно их терять.
+        if str(self.text.text.cget("state")) == "normal":
+            self._custom_text = self.text.text.get("1.0", "end-1c")
         if custom:
             self._set_preview(self._custom_text, True)
             self.section.configure(text="СВОЙ ХАРАКТЕР")
@@ -305,12 +308,12 @@ class PersonaDialog(Dialog):
     def _save(self) -> None:
         key = self.choice.get()
         if key == self.CUSTOM:
-            value = self.text.text.get("1.0", "end-1c")
+            # Переносы строк сохраняем: абзацы не схлопываются в одну строку.
+            value = tidy_persona(self.text.text.get("1.0", "end-1c"))[:PERSONA_MAX_CHARS]
         else:
             # Для готовых характеров сохраняем название: в .env читается человеком,
             # а полный текст подставляется из PERSONAS при сборке промпта.
             value = self._personas.get(key, ("neutral", ""))[0]
-        value = " ".join(str(value).split()).strip()[:PERSONA_MAX_CHARS]
         self.close()
         self._on_save(value)
 

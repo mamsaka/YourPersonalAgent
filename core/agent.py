@@ -4,7 +4,7 @@ import json
 import threading
 from typing import Any, Callable
 
-from .config import AgentConfig
+from .config import AgentConfig, PERSONA_MAX_CHARS, tidy_persona
 from .memory import MemoryStore
 from .openrouter import OpenRouterClient, OpenRouterToolsUnsupported
 from .tools import ToolRegistry
@@ -306,8 +306,6 @@ PERSONAS: dict[str, tuple[str, str]] = {
     "sarcastic": ("Саркастичный", PERSONA_SARCASTIC),
 }
 
-PERSONA_MAX_CHARS = 10_000
-
 
 def _norm(value: str) -> str:
     """Схлопнуть пробелы: готовые характеры многострочные, а из .env приходят в одну строку."""
@@ -315,15 +313,19 @@ def _norm(value: str) -> str:
 
 
 def resolve_persona(persona: str) -> tuple[str, str]:
-    """Вернуть (название готового характера, текст). Название пустое — значит это свой текст."""
-    persona = _norm(persona)
-    if not persona:
+    """Вернуть (название готового характера, текст). Название пустое — значит это свой текст.
+
+    Для своего текста возвращается исходная строка: переносы строк сохраняются.
+    """
+    raw = str(persona or "").strip()
+    if not raw:
         return "", ""
-    lowered = persona.lower()
+    flat = _norm(raw)
+    lowered = flat.lower()
     for key, (name, desc) in PERSONAS.items():
-        if lowered in (key.lower(), name.lower()) or persona == _norm(desc):
+        if lowered in (key.lower(), name.lower()) or flat == _norm(desc):
             return name, desc
-    return "", persona
+    return "", raw
 
 
 def persona_instruction(persona: str) -> str:
