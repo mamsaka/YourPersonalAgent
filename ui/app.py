@@ -13,7 +13,7 @@ from typing import Any
 from core import browser as browser_module
 from core import terminals as terminals_module
 from core.agent import AgentCancelled, AgentError, PersonalAgent
-from core.config import APP_DATA, ENV_FILE, UI_SETTINGS_FILE, AgentConfig
+from core.config import APP_DATA, ENV_FILE, UI_SETTINGS_FILE, AgentConfig, env_has, is_valid_geometry
 from core.memory import MemoryStore
 from core.openrouter import OpenRouterClient, OpenRouterError
 from core.tools import ConfirmRequest, ToolRegistry
@@ -29,6 +29,13 @@ DEFAULT_SESSION_NAME = "Новый чат"
 MAX_RENDERED_MESSAGES = 200
 APP_TITLE = "Personal AI Agent"
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+USAGE_TOOLTIP = (
+    "Расход текущего чата.\n"
+    "Запросы — обращения к модели (шаги).\n"
+    "Контекст — входные токены (отправленная история).\n"
+    "Токены — всего израсходовано (вход + выход).\n"
+    "Расход — стоимость в долларах по данным OpenRouter."
+)
 
 WELCOME_TITLE = "Чем займёмся?"
 WELCOME_SUBTITLE = (
@@ -105,9 +112,11 @@ class AgentApp(tk.Tk):
 
         self.config_obj = AgentConfig.from_env()
         self.settings = UiSettings(UI_SETTINGS_FILE)
+        self._migrate_legacy_settings()
+        self._restore_geometry()
         self.memory = MemoryStore(APP_DATA / "agent.sqlite3")
         self.client = OpenRouterClient(self.config_obj)
-        confirm = bool(self.settings.get("confirm_dangerous", self.config_obj.confirm_dangerous))
+        confirm = bool(self.config_obj.confirm_dangerous)
         self.tools = ToolRegistry(self.memory, confirm_enabled=confirm)
         self.tools.confirm_hook = self._confirm_hook
         self.agent = PersonalAgent(self.config_obj, self.client, self.memory, self.tools)
@@ -118,6 +127,8 @@ class AgentApp(tk.Tk):
         self.chat: ChatView | None = None
         self.input: tk.Text | None = None
         self.status_label: tk.Label | None = None
+        self.usage_label: tk.Label | None = None
+        self.usage_tooltip: Tooltip | None = None
         self._confirm_dialog: ConfirmDialog | None = None
         self._session_ids: list[int] = []
         self._model_values: list[str] = []
@@ -129,11 +140,15 @@ class AgentApp(tk.Tk):
         self._status_kind = "muted"
         self._editing_message_id: int | None = None
         self._ws = str(self.tk.call("tk", "windowingsystem"))
-        self.current_session_id = self.memory.get_default_session_id()
+        self.current_session_id = self._restore_session()
         self.agent.set_session(self.current_session_id)
         self.status_var = tk.StringVar(value="Готов")
+        self.usage_var = tk.StringVar(value="")
         self.model_var = tk.StringVar(value=self.config_obj.model)
         self.search_var = tk.StringVar()
+        self.model_search_var = tk.StringVar()
+        self._all_models: list[dict[str, Any]] = []
+        self._model_list_data: list[str] = []
 
         hotkeys.install(self, lambda: self.theme.c if self.theme else {})
         hotkeys.install_shortcuts(self, {
@@ -144,6 +159,29 @@ class AgentApp(tk.Tk):
 
         self._rebuild()
         self._poll_events()
+
+    # ------------------------------------------------------------------ настройки из .env
+
+    def _migrate_legacy_settings(self) -> None:
+        """Разово перенести тему и подтверждения из data/ui_settings.json в .env."""
+        if not env_has("AGENT_THEME"):
+            legacy_theme = self.settings.get("theme")
+            if legacy_theme in ("dark", "light"):
+                self.config_obj.save_theme(str(legacy_theme))
+        if not env_has("AGENT_CONFIRM_DANGEROUS"):
+            legacy_confirm = self.settings.get("confirm_dangerous")
+            if isinstance(legacy_confirm, bool):
+                self.config_obj.save_confirm(legacy_confirm)
+
+    def _restore_geometry(self) -> None:
+        """Восстановить размер и позицию окна из .env, если они сохранены."""
+        saved = (self.config_obj.window_geometry or "").strip()
+        if not is_valid_geometry(saved):
+            return
+        try:
+            self.geometry(saved)
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------------ построение интерфейса
 
@@ -163,7 +201,7 @@ class AgentApp(tk.Tk):
         for child in self.winfo_children():
             child.destroy()
         self._confirm_dialog = None if self._confirm_dialog is None or not self._confirm_dialog.winfo_exists() else self._confirm_dialog
-        self.theme = Theme(self, str(self.settings.get("theme", "dark")))
+        self.theme = Theme(self, self.config_obj.theme)
         self.theme.apply(self)
         self._hover_index = -1
         self._build_ui()
@@ -173,6 +211,7 @@ class AgentApp(tk.Tk):
         self._render_history()
         self._update_key_state()
         self._update_confirm_toggle()
+        self._refresh_usage()
         self._on_input_change()
         self.input.focus_set()
 
@@ -252,12 +291,22 @@ class AgentApp(tk.Tk):
         toolbar = tk.Frame(top, bg=c["bg"])
         toolbar.pack(side="right", fill="y", padx=(4, 16))
         FlatButton(toolbar, th, "↻", self._load_models, kind="bar", padx=10, pady=5,
-                   tooltip="Обновить список бесплатных моделей").pack(side="right", pady=14)
-        self.model_box = ttk.Combobox(toolbar, textvariable=self.model_var, width=30, values=self._model_values)
+                   tooltip="Обновить список моделей").pack(side="right", pady=14)
+        model_search_frame, self.model_search_entry = make_entry(toolbar, th, textvariable=self.model_search_var,
+                                                                  bg=c["bg"])
+        self.model_search_entry.configure(font=th.font_ui, width=16)
+        model_search_frame.pack(side="right", padx=(6, 0), pady=13)
+        Tooltip(self.model_search_entry, "Поиск модели по названию", th)
+        self.model_search_var.trace_add("write", lambda *_: self._filter_models())
+        # Поле текущей модели в панели (обычный вид)
+        self.model_box = ttk.Combobox(toolbar, textvariable=self.model_var, width=34, values=self._model_values)
         self.model_box.pack(side="right", padx=6, pady=15)
         self.model_box.bind("<<ComboboxSelected>>", self._model_changed)
         self.model_box.bind("<Return>", self._model_changed)
         self.model_box.bind("<FocusOut>", self._model_changed)
+        # Кнопка открыть цветной список моделей
+        FlatButton(toolbar, th, "📋", self._open_model_picker, kind="bar", padx=8, pady=5,
+                   tooltip="Выбрать модель из списка (:free — зелёный, остальные — красный)").pack(side="right", padx=(6, 0), pady=14)
         tk.Label(toolbar, text="Модель", bg=c["bg"], fg=c["muted"], font=th.font_small).pack(side="right", padx=(0, 2))
         self.safety_chip = tk.Label(toolbar, text="⚠ без подтверждений", bg=c["bg"], fg=c["warn"], font=th.font_small_bold,
                                     cursor="hand2")
@@ -315,6 +364,10 @@ class AgentApp(tk.Tk):
         self.hint_label.pack(side="left")
         self.status_label = tk.Label(status_row, textvariable=self.status_var, bg=c["bg"], fg=c["muted"], font=th.font_small)
         self.status_label.pack(side="right")
+        self.usage_label = tk.Label(status_row, textvariable=self.usage_var, bg=c["bg"], fg=c["muted"],
+                                    font=th.font_small)
+        self.usage_label.pack(side="right", padx=(0, 16))
+        self.usage_tooltip = Tooltip(self.usage_label, USAGE_TOOLTIP, th)
 
         self._set_busy(self.busy)
         self._render_status()
@@ -400,6 +453,50 @@ class AgentApp(tk.Tk):
             except tk.TclError:
                 pass
 
+    @staticmethod
+    def _format_number(value: Any) -> str:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = 0
+        return f"{number:,}".replace(",", " ")
+
+    @staticmethod
+    def _format_money(value: Any) -> str:
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount <= 0:
+            return "$0.00"
+        if amount >= 1:
+            return f"${amount:,.2f}".replace(",", " ")
+        if amount >= 0.01:
+            return f"${amount:.4f}"
+        return f"${amount:.6f}"
+
+    def _format_usage(self, usage: dict[str, Any]) -> str:
+        return (
+            f"Запросы: {self._format_number(usage.get('requests'))}"
+            f"   ·   Контекст: {self._format_number(usage.get('prompt_tokens'))}"
+            f"   ·   Токены: {self._format_number(usage.get('total_tokens'))}"
+            f"   ·   Расход: {self._format_money(usage.get('cost'))}"
+        )
+
+    def _refresh_usage(self, usage: dict[str, Any] | None = None) -> None:
+        """Обновить счётчик расхода текущего чата и подсказку с общим итогом."""
+        if usage is None:
+            usage = self.memory.get_usage(self.current_session_id)
+        self.usage_var.set(self._format_usage(usage))
+        if self.usage_tooltip is not None:
+            total = self.memory.get_total_usage()
+            self.usage_tooltip.text = (
+                f"{USAGE_TOOLTIP}\n\nВсего за всё время: "
+                f"{self._format_number(total.get('requests'))} запросов, "
+                f"{self._format_number(total.get('total_tokens'))} токенов, "
+                f"{self._format_money(total.get('cost'))}."
+            )
+
     def _update_window_title(self) -> None:
         name = self.memory.get_session_name(self.current_session_id) or ""
         prefix = "● " if self.busy else ""
@@ -419,7 +516,7 @@ class AgentApp(tk.Tk):
 
     def _set_confirm(self, value: bool) -> None:
         self.tools.confirm_enabled = bool(value)
-        self.settings.set("confirm_dangerous", self.tools.confirm_enabled)
+        self.config_obj.save_confirm(self.tools.confirm_enabled)
         self._update_confirm_toggle()
         if self.tools.confirm_enabled:
             self._set_status("Подтверждения включены")
@@ -436,7 +533,7 @@ class AgentApp(tk.Tk):
         assert self.theme is not None
         if name == self.theme.name:
             return
-        self.settings.set("theme", name)
+        self.config_obj.save_theme(name)
         self._rebuild()
         if reopen_settings:
             self.after(50, self._open_settings)
@@ -470,19 +567,190 @@ class AgentApp(tk.Tk):
     def _model_changed(self, _event=None) -> None:
         value = self.model_var.get().strip()
         if value and value != self.config_obj.model:
-            self.config_obj.model = value
+            self.config_obj.save_model(value)
+            self.model_var.set(value)
             self._set_status(f"Модель: {value}")
 
     def _load_models(self) -> None:
-        self._set_status("Загрузка каталога бесплатных моделей…")
+        self._set_status("Загрузка каталога моделей…")
 
         def worker() -> None:
             try:
-                self.events.put(("models", self.client.list_free_models()))
+                self.events.put(("models", self.client.list_models()))
             except Exception as exc:  # noqa: BLE001
                 self.events.put(("error", str(exc)))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _open_model_picker(self) -> None:
+        """Открыть всплывающее окно с цветным списком моделей.
+        :free — зелёный, остальные — красный. При выборе модель применяется.
+        """
+        if not self._all_models:
+            self._set_status("Сначала загрузите список моделей (кнопка ↻)", "warn")
+            return
+
+        picker = tk.Toplevel(self)
+        c = self.theme.c
+        picker.title("Выбрать модель")
+        picker.configure(bg=c["panel"])
+        picker.transient(self)
+        picker.grab_set()
+
+        # Поиск внутри пикера
+        top_frame = tk.Frame(picker, bg=c["panel"])
+        top_frame.pack(fill="x", padx=12, pady=(10, 6))
+        tk.Label(top_frame, text="Поиск:", bg=c["panel"], fg=c["text"], font=self.theme.font_small).pack(side="left", padx=(0, 6))
+        search_var = tk.StringVar()
+        entry_frame, entry = make_entry(top_frame, self.theme, textvariable=search_var, bg=c["input_bg"])
+        entry_frame.pack(side="left", fill="x", expand=True)
+        entry.focus_set()
+        # Placeholder текст
+        placeholder_text = "Поиск модели…"
+        entry.insert(0, placeholder_text)
+        entry.configure(fg=c["muted"])
+        is_placeholder = [True]
+
+        def on_focus_in(_e):
+            if is_placeholder[0]:
+                entry.delete(0, "end")
+                entry.configure(fg=c["text"])
+                is_placeholder[0] = False
+
+        def on_focus_out(_e):
+            if not entry.get().strip():
+                entry.insert(0, placeholder_text)
+                entry.configure(fg=c["muted"])
+                is_placeholder[0] = True
+
+        entry.bind("<FocusIn>", on_focus_in)
+        entry.bind("<FocusOut>", on_focus_out)
+        # Кнопка очистки поиска
+        clear_btn = tk.Label(top_frame, text="×", bg=c["panel"], fg=c["muted"],
+                             font=self.theme.font_ui_bold, cursor="hand2", padx=6, pady=2)
+        clear_btn.pack(side="left", padx=(6, 0))
+        clear_btn_enabled = [False]
+
+        def _clear_search():
+            search_var.set("")
+            entry.delete(0, "end")
+            entry.insert(0, placeholder_text)
+            entry.configure(fg=c["muted"])
+            is_placeholder[0] = True
+            clear_btn.configure(fg=c["muted"])
+
+        def _on_clear_enter(_e):
+            if clear_btn_enabled[0]:
+                clear_btn.configure(fg=c["accent"])
+
+        def _on_clear_leave(_e):
+            if clear_btn_enabled[0]:
+                clear_btn.configure(fg=c["muted"])
+
+        def _on_clear_click(_e):
+            if clear_btn_enabled[0]:
+                _clear_search()
+
+        clear_btn.bind("<Enter>", _on_clear_enter)
+        clear_btn.bind("<Leave>", _on_clear_leave)
+        clear_btn.bind("<ButtonRelease-1>", _on_clear_click)
+
+        def _on_search_change(*_):
+            val = search_var.get().strip()
+            has_text = bool(val) and val != placeholder_text
+            clear_btn_enabled[0] = has_text
+            clear_btn.configure(fg=c["accent"] if has_text else c["muted"])
+
+        search_var.trace_add("write", lambda *_: (_on_search_change(), fill_picker()))
+
+        # Листбокс с цветами
+        list_frame = tk.Frame(picker, bg=c["panel"])
+        list_frame.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        picker_list = tk.Listbox(list_frame, width=40, height=15, bg=c["input_bg"], fg=c["text"],
+                                 font=self.theme.font_ui, selectbackground=c["select"],
+                                 selectforeground=c["text"], borderwidth=0, highlightthickness=0)
+        picker_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=picker_list.yview)
+        picker_list.configure(yscrollcommand=picker_scroll.set)
+        picker_scroll.pack(side="right", fill="y")
+        picker_list.pack(side="left", fill="both", expand=True)
+
+        # Данные для отображения
+        picker_data = []
+
+        def fill_picker():
+            picker_list.delete(0, "end")
+            picker_data.clear()
+            q = search_var.get().strip().lower()
+            for item in self._all_models:
+                mid = item.get("id", "")
+                if q and q not in str(mid).lower() and q not in str(item.get("name", "")).lower():
+                    continue
+                picker_list.insert("end", mid)
+                picker_data.append(mid)
+                idx = picker_list.size() - 1
+                if mid.endswith(":free"):
+                    picker_list.itemconfigure(idx, fg=c["ok"])
+                else:
+                    picker_list.itemconfigure(idx, fg=c["danger"])
+            # Выбрать текущую модель
+            current = self.config_obj.model
+            if current in picker_data:
+                idx = picker_data.index(current)
+                picker_list.selection_set(idx)
+                picker_list.see(idx)
+
+        fill_picker()
+        search_var.trace_add("write", lambda *_: fill_picker())
+
+        # Кнопки
+        btn_frame = tk.Frame(picker, bg=c["panel"])
+        btn_frame.pack(fill="x", padx=12, pady=(6, 12))
+
+        def apply_choice():
+            selection = picker_list.curselection()
+            if selection:
+                value = picker_list.get(selection[0])
+            else:
+                value = ""
+            if value:
+                self.config_obj.save_model(value)
+                self.model_var.set(value)
+                self._set_status(f"Модель: {value}")
+            picker.destroy()
+
+        FlatButton(btn_frame, self.theme, "Применить", apply_choice, kind="accent", padx=16).pack(side="right")
+        FlatButton(btn_frame, self.theme, "Отмена", picker.destroy, kind="ghost", padx=16).pack(side="right", padx=(0, 8))
+
+        picker.bind("<Escape>", lambda e: picker.destroy())
+        picker.bind("<Return>", lambda e: apply_choice())
+        picker_list.bind("<Double-Button-1>", lambda e: apply_choice())
+
+        picker.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - picker.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - picker.winfo_height()) // 2
+        picker.geometry(f"+{x}+{y}")
+
+    def _filter_models(self) -> None:
+        """Отфильтровать список моделей по поисковой строке (имя или ID).
+        Модели, заканчивающиеся на :free, окрашиваются зелёным, остальные — красным.
+        """
+        if not hasattr(self, "model_box"):
+            return
+        # Обновить значения в Combobox панели
+        query = self.model_search_var.get().strip().lower()
+        if query:
+            values = [
+                item["id"] for item in self._all_models
+                if query in str(item.get("id", "")).lower() or query in str(item.get("name", "")).lower()
+            ]
+        else:
+            values = [item["id"] for item in self._all_models]
+        self._model_values = values
+        self.model_box["values"] = values
+        # Выбрать текущую модель
+        current = self.config_obj.model
+        if current in values:
+            self.model_var.set(current)
 
     # ------------------------------------------------------------------ сессии
 
@@ -553,12 +821,21 @@ class AgentApp(tk.Tk):
             return
         self._switch_session(session_id)
 
+    def _restore_session(self) -> int:
+        """Вернуть последний активный чат из .env, если он ещё существует."""
+        last = self.config_obj.last_session
+        if isinstance(last, int) and self.memory.get_session_name(last) is not None:
+            return last
+        return self.memory.get_default_session_id()
+
     def _switch_session(self, session_id: int) -> None:
         self._editing_message_id = None
         self.current_session_id = session_id
         self.agent.set_session(session_id)
+        self.config_obj.save_last_session(session_id)
         self._refresh_sessions(select=session_id)
         self._render_history()
+        self._refresh_usage()
         self.input.focus_set()
 
     def _new_session(self) -> None:
@@ -637,33 +914,68 @@ class AgentApp(tk.Tk):
         self.chat.scroll_to_bottom(force=True)
 
     def _rollback_to_message(self, message_id: int, original_text: str) -> None:
-        """Оставить историю до выбранного запроса и открыть его для редактирования."""
+        """Удаляет выбранное сообщение и всю историю после него,
+        перенося исходный текст в поле ввода."""
         if self.busy:
-            self._set_status("Сначала останови или дождись завершения текущего ответа.", "warn")
+            self._set_status(
+                "Сначала останови или дождись завершения текущего ответа.",
+                "warn"
+            )
             return
+
         rows = self.memory.get_session_messages(self.current_session_id)
-        selected = next((row for row in rows if row.get("id") == message_id), None)
+
+        selected = next(
+            (row for row in rows if row.get("id") == message_id),
+            None
+        )
+
         if selected is None or selected.get("role") != "user":
             self._set_status("Не удалось найти выбранное сообщение.", "warn")
             return
+
         prompt = str(selected.get("content") or original_text)
-        later_count = sum(1 for row in rows if row.get("id", 0) > message_id)
-        if later_count and not messagebox.askyesno(
-            "Вернуться к сообщению",
-            "Все сообщения после выбранного будут удалены. Сам запрос останется в истории "
-            "и загрузится в поле ввода для редактирования. Продолжить?",
+
+        delete_count = sum(
+            1 for row in rows
+            if row.get("id", 0) >= message_id
+        )
+
+        if delete_count and not messagebox.askyesno(
+            "Откат чата",
+            "Выбранное сообщение и все сообщения после него "
+            "будут удалены из истории.\n\n"
+            "Текст выбранного сообщения будет перенесён "
+            "в поле ввода для редактирования.\n\n"
+            "Продолжить?",
             parent=self,
         ):
             return
 
-        self.memory.delete_messages_after(self.current_session_id, message_id)
-        self._editing_message_id = message_id
+        # Удаляем выбранное сообщение ВКЛЮЧИТЕЛЬНО
+        self.memory.delete_messages_after(
+            self.current_session_id,
+            message_id,
+            include_message=True
+        )
+
+        # Больше не редактируем старое сообщение
+        self._editing_message_id = None
+
+        # Обновляем отображение чата
         self._render_history()
+
+        # Возвращаем текст удалённого сообщения в поле ввода
         self.input.delete("1.0", "end")
         self.input.insert("1.0", prompt)
+
         self._on_input_change()
         self.input.focus_set()
-        self._set_status("Запрос восстановлен: отредактируй его или отправь без изменений.", "ok")
+
+        self._set_status(
+            "Откат выполнен. Сообщение удалено из истории и восстановлено в поле ввода.",
+            "ok"
+        )
 
     def _regenerate_message(self, message_id: int) -> None:
         """Удалить выбранный ответ и всё после него, затем повторить запрос к модели."""
@@ -883,7 +1195,15 @@ class AgentApp(tk.Tk):
         assert self.chat is not None
         if kind == "status":
             self._set_status(str(payload))
+        elif kind == "answer_delta":
+            if not self.chat.streaming:
+                self.chat.start_stream()
+            self.chat.stream_push(str(payload))
         elif kind == "tool_call":
+            if self.chat.streaming:
+                self.chat.finish_stream()
+            if self.chat.reasoning_streaming:
+                self.chat.finish_reasoning()
             data = json.loads(payload)
             self.chat.add_tool_call(data.get("name", "?"), data.get("arguments", {}))
         elif kind == "tool_result":
@@ -892,8 +1212,16 @@ class AgentApp(tk.Tk):
                 self.chat.finish_tool(data.get("name", "?"), data["error"], error=True)
             else:
                 self.chat.finish_tool(data.get("name", "?"), data.get("result"))
+        elif kind == "reasoning_delta":
+            self.chat.push_reasoning(str(payload))
         elif kind == "reasoning":
-            self.chat.add_reasoning(str(payload))
+            self.chat.finish_reasoning(str(payload))
+        elif kind == "usage":
+            try:
+                data = json.loads(payload) if isinstance(payload, str) else payload
+            except (ValueError, TypeError):
+                data = None
+            self._refresh_usage(data if isinstance(data, dict) else None)
         elif kind == "warning":
             self.chat.add_message("system", str(payload))
         elif kind == "answer":
@@ -902,14 +1230,27 @@ class AgentApp(tk.Tk):
                 message_id = payload.get("message_id")
             else:  # совместимость с очередью событий старого формата
                 answer_text, message_id = str(payload), None
-            self.chat.add_message("assistant", answer_text, message_id=message_id)
+            if self.chat.streaming:
+                self.chat.finish_stream(answer_text, message_id=message_id)
+            else:
+                self.chat.add_message("assistant", answer_text, message_id=message_id)
+            if self.chat.reasoning_streaming:
+                self.chat.finish_reasoning()
             self._status_text, self._status_kind = "Готов", "ok"
             self._finish_run()
         elif kind == "cancelled":
+            if self.chat.streaming:
+                self.chat.finish_stream()
+            if self.chat.reasoning_streaming:
+                self.chat.finish_reasoning()
             self.chat.add_message("system", "Остановлено.")
             self._status_text, self._status_kind = "Остановлено", "warn"
             self._finish_run()
         elif kind == "error":
+            if self.chat.streaming:
+                self.chat.finish_stream()
+            if self.chat.reasoning_streaming:
+                self.chat.finish_reasoning()
             self.chat.add_message("error", str(payload))
             self._status_text, self._status_kind = "Ошибка", "danger"
             if self.busy:
@@ -917,10 +1258,9 @@ class AgentApp(tk.Tk):
             else:
                 self._render_status()
         elif kind == "models":
-            values = [item["id"] for item in payload if item.get("id")]
-            self._model_values = values
-            self.model_box["values"] = values
-            self._set_status(f"Загружено бесплатных моделей: {len(values)}", "ok")
+            self._all_models = [item for item in payload if item.get("id")]
+            self._filter_models()
+            self._set_status(f"Загружено моделей: {len(self._all_models)}", "ok")
         elif kind == "confirm":
             self._show_confirm(payload)
 
@@ -941,6 +1281,10 @@ class AgentApp(tk.Tk):
     def _on_close(self) -> None:
         if self.busy and not messagebox.askyesno("Выход", "Агент ещё работает. Остановить и выйти?", parent=self):
             return
+        try:
+            self.config_obj.save_window_geometry(self.geometry())
+        except tk.TclError:
+            pass
         self.agent.cancel()
         try:
             terminals_module.shutdown()

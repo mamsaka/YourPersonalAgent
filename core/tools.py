@@ -47,6 +47,9 @@ class ToolRegistry:
         self._handlers: dict[str, Callable[..., Any]] = {}
         self._schemas: dict[str, dict[str, Any]] = {}
         self._generated: dict[str, dict[str, Any]] = {}
+        # Сквозные ID системных инструментов по порядку регистрации.
+        self._tool_ids: dict[str, int] = {}
+        self._next_tool_id = 1
         self._register_builtins()
         self._builtin_names = set(self._handlers)
         self._load_generated()
@@ -54,6 +57,9 @@ class ToolRegistry:
     # ------------------------------------------------------------------ регистрация
 
     def _register(self, name: str, description: str, properties: dict[str, Any], required: list[str], handler: Callable[..., Any]) -> None:
+        if name not in self._tool_ids:
+            self._tool_ids[name] = self._next_tool_id
+            self._next_tool_id += 1
         self._handlers[name] = handler
         self._schemas[name] = {
             "type": "function",
@@ -342,7 +348,7 @@ class ToolRegistry:
     def _confirmation_needed(self, name: str, args: dict[str, Any]) -> tuple[str, bool] | None:
         """Вернуть (причина, можно_ли_разрешить_на_сессию) или None, если подтверждение не нужно."""
         if name == "delete_path":
-            return "Удаление файла или папки", False
+            return "Удаление файла или папки", True
         if name in ("write_file", "edit_file"):
             try:
                 target = self._resolve_path(str(args.get("path", "")))
@@ -352,7 +358,7 @@ class ToolRegistry:
                 return "Запись файла за пределами папки workspace", True
             return None
         if name == "create_python_tool":
-            return "Создание Python-инструмента (код будет выполняться с вашими правами)", True
+            return "Создание Python-инструмента (код будет выполняться с вашими правами)", False
         if name == "use_cmd" and str(args.get("action", "")).lower() == "execute":
             return "Выполнение команды в терминале", True
         if name == "use_browser" and str(args.get("action", "")).lower() == "type_text":
@@ -803,11 +809,16 @@ class ToolRegistry:
     def list_tool_names(self) -> list[str]:
         return sorted(self._handlers)
 
-    def describe_tools(self) -> list[dict[str, str]]:
+    def describe_tools(self) -> list[dict[str, Any]]:
         items = []
         for name in sorted(self._schemas):
             description = self._schemas[name]["function"]["description"]
-            items.append({"name": name, "kind": "встроенный" if name in self._builtin_names else "сгенерированный", "description": description})
+            items.append({
+                "id": self._tool_ids.get(name),
+                "name": name,
+                "kind": "встроенный" if name in self._builtin_names else "сгенерированный",
+                "description": description,
+            })
         return items
 
     def call(self, name: str, arguments: dict[str, Any]) -> Any:

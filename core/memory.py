@@ -76,6 +76,23 @@ class MemoryStore:
             """)
 
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS usage (
+                    session_id INTEGER PRIMARY KEY,
+                    requests INTEGER NOT NULL DEFAULT 0,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost REAL NOT NULL DEFAULT 0
+                )
+            """)
+
+            # Миграция для баз, созданных до появления столбца cost.
+            try:
+                conn.execute("ALTER TABLE usage ADD COLUMN cost REAL NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+
+            conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON messages(session_id, id)
             """)
@@ -147,6 +164,10 @@ class MemoryStore:
         with self._connect() as conn:
             conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.execute(
+                "DELETE FROM usage WHERE session_id = ?",
                 (session_id,),
             )
             conn.execute(
@@ -367,6 +388,88 @@ class MemoryStore:
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
+            conn.execute(
+                "DELETE FROM usage WHERE session_id = ?",
+                (session_id,),
+            )
+
+    # ---------------------------------------------------------
+    # РАСХОД (запросы, контекст, токены)
+    # ---------------------------------------------------------
+
+    def add_usage(
+        self,
+        session_id: int,
+        requests: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        cost: float = 0.0,
+    ) -> dict[str, Any]:
+        """Прибавить расход текущего запроса и вернуть накопленные суммы сессии."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO usage(session_id, requests, prompt_tokens, completion_tokens, total_tokens, cost)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    requests = requests + excluded.requests,
+                    prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    total_tokens = total_tokens + excluded.total_tokens,
+                    cost = cost + excluded.cost
+                """,
+                (
+                    session_id,
+                    int(requests),
+                    int(prompt_tokens),
+                    int(completion_tokens),
+                    int(total_tokens),
+                    float(cost or 0.0),
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT requests, prompt_tokens, completion_tokens, total_tokens, cost
+                FROM usage WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+
+        return dict(row) if row else self._empty_usage()
+
+    def get_usage(self, session_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT requests, prompt_tokens, completion_tokens, total_tokens, cost
+                FROM usage WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+
+        return dict(row) if row else self._empty_usage()
+
+    def get_total_usage(self) -> dict[str, Any]:
+        """Суммарный расход по всем сессиям."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(requests), 0) AS requests,
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(cost), 0) AS cost
+                FROM usage
+                """
+            ).fetchone()
+
+        return dict(row) if row else self._empty_usage()
+
+    @staticmethod
+    def _empty_usage() -> dict[str, Any]:
+        return {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0.0}
 
     # ---------------------------------------------------------
     # ВОСПОМИНАНИЯ

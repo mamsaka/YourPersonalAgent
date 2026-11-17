@@ -433,7 +433,7 @@ class InventoryDialog(Dialog):
 
         body = tk.Frame(self, bg=c["panel"])
         body.pack(fill="both", expand=True, padx=20, pady=(12, 0))
-        self.tree = ttk.Treeview(body, columns=("name", "kind", "description"), show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(body, columns=("id", "name", "kind", "description"), show="headings", selectmode="browse")
         scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -452,13 +452,17 @@ class InventoryDialog(Dialog):
         self.tab_skills.set_text(f"Навыки ({len(self._skill_rows)})")
         px = self.theme.px
         if tab == "tools":
-            self.tree.configure(columns=("name", "kind", "description"), displaycolumns=("name", "kind", "description"))
-            for column, title, width in (("name", "Имя", 170), ("kind", "Тип", 120), ("description", "Описание", 560)):
+            self.tree.configure(columns=("id", "name", "kind", "description"),
+                                displaycolumns=("id", "name", "kind", "description"))
+            for column, title, width in (("id", "ID", 54), ("name", "Имя", 160), ("kind", "Тип", 110),
+                                         ("description", "Описание", 510)):
                 self.tree.heading(column, text=title)
-                self.tree.column(column, width=px(width), stretch=(column == "description"))
+                self.tree.column(column, width=px(width), anchor="w" if column == "description" else "center",
+                                 stretch=(column == "description"))
             self.open_btn.pack_forget()
         else:
-            self.tree.configure(columns=("name", "kind", "description"), displaycolumns=("name", "description"))
+            self.tree.configure(columns=("id", "name", "kind", "description"),
+                                displaycolumns=("name", "description"))
             self.tree.heading("name", text="Навык")
             self.tree.heading("description", text="Описание (двойной щелчок — открыть)")
             self.tree.column("name", width=px(190), stretch=False)
@@ -466,25 +470,28 @@ class InventoryDialog(Dialog):
             self.open_btn.pack(side="left")
         self._fill()
 
-    def _rows(self) -> list[tuple[str, str, str]]:
+    def _rows(self) -> list[tuple[str, str, str, str]]:
         if self._tab == "tools":
-            return [(i["name"], i["kind"], str(i["description"])) for i in self._tool_rows]
-        return [(s["name"], "", str(s["description"])) for s in self._skill_rows]
+            return [
+                ("" if i.get("id") is None else str(i["id"]), i["name"], i["kind"], str(i["description"]))
+                for i in self._tool_rows
+            ]
+        return [("", s["name"], "", str(s["description"])) for s in self._skill_rows]
 
     def _fill(self) -> None:
         query = self.search_var.get().strip().lower()
         for item in self.tree.get_children():
             self.tree.delete(item)
-        self._visible: dict[str, tuple[str, str, str]] = {}
-        for index, (name, kind, desc) in enumerate(self._rows()):
+        self._visible: dict[str, tuple[str, str, str, str]] = {}
+        for index, (tool_id, name, kind, desc) in enumerate(self._rows()):
             if query and query not in name.lower() and query not in desc.lower():
                 continue
             iid = str(index)
-            self._visible[iid] = (name, kind, desc)
-            self.tree.insert("", "end", iid=iid, values=(name, kind, desc.replace("\n", " ")[:220]))
+            self._visible[iid] = (tool_id, name, kind, desc)
+            self.tree.insert("", "end", iid=iid, values=(tool_id, name, kind, desc.replace("\n", " ")[:220]))
         self.detail.set_content("Выбери строку, чтобы увидеть полное описание.")
 
-    def _selected(self) -> tuple[str, str, str] | None:
+    def _selected(self) -> tuple[str, str, str, str] | None:
         selection = self.tree.selection()
         if not selection:
             return None
@@ -493,7 +500,9 @@ class InventoryDialog(Dialog):
     def _show_selected(self) -> None:
         row = self._selected()
         if row:
-            self.detail.set_content(f"{row[0]}\n\n{row[2]}")
+            tool_id, name, _kind, desc = row
+            prefix = f"ID {tool_id} · " if tool_id else ""
+            self.detail.set_content(f"{prefix}{name}\n\n{desc}")
 
     def _open_skill(self) -> None:
         if self._tab != "skills":
@@ -501,8 +510,9 @@ class InventoryDialog(Dialog):
         row = self._selected()
         if not row:
             return
+        name = row[1]
         try:
-            content = self.tools.read_skill(row[0])
+            content = self.tools.read_skill(name)
         except Exception as exc:  # noqa: BLE001
             content = f"Не удалось прочитать навык: {exc}"
-        TextViewer(self, self.theme, f"Навык: {row[0]}", clip(content, 60000))
+        TextViewer(self, self.theme, f"Навык: {name}", clip(content, 60000))

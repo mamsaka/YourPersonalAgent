@@ -34,6 +34,10 @@ class ChatView(tk.Frame):
         self._pad = theme.px(32)
         self._jump_visible = False
         self.welcome_visible = False
+        self._stream: dict[str, Any] | None = None
+        self._reasoning: dict[str, Any] | None = None
+        self._reasoning_chars = 0
+        self._pending_reasoning = ""
         self._on_rollback: Callable[[int, str], None] | None = None
         self._on_regenerate: Callable[[int], None] | None = None
 
@@ -324,6 +328,94 @@ class ChatView(tk.Frame):
         self._end_write()
         return number
 
+    # ------------------------------ потоковый ответ ------------------------------
+
+    @property
+    def streaming(self) -> bool:
+        return self._stream is not None
+
+    def start_stream(self) -> int:
+        """Начать потоковый ответ ассистента. Возвращает номер сообщения."""
+        if self._stream is not None:
+            return self._stream["number"]
+
+        number = self._counter + 1
+        self._counter = number
+        self._stream = {"number": number, "text": "", "start": None}
+
+        self._begin_write()
+        self._block_gap()
+        self._stream["start"] = self.text.index("end-1c")
+        self._put(f"●  {ROLE_TITLES['assistant']}", "hdr", "hdr_assistant")
+        self._raw[number] = ""
+        copy_tag = f"__chat_copy_{number}"
+        self._card_tags.append(copy_tag)
+        self._put("      ", "hdr")
+        self._mark(f"__chat_copy_{number}_s")
+        self._put("Копировать", "hdr", "hdr_copy", copy_tag)
+        self._mark(f"__chat_copy_{number}_e")
+        self.text.tag_bind(copy_tag, "<ButtonRelease-1>", lambda e, n=number: self._copy_message(n))
+        self._hover_link(copy_tag)
+        self._put("\n", "hdr")
+        self._mark(f"__chat_stream_{number}_s")
+        self._mark(f"__chat_stream_{number}_e", gravity="right")
+        self._put("\n", "body")
+        self._end_write()
+        return number
+
+    def stream_push(self, text: str) -> None:
+        """Дописать очередной кусок текста в текущий потоковый ответ."""
+        if self._stream is None or not text:
+            return
+        self._stream["text"] += text
+        number = self._stream["number"]
+        self._raw[number] = self._stream["text"]
+        self._begin_write()
+        self.text.insert(f"__chat_stream_{number}_e", text, "body")
+        self._end_write()
+
+    def finish_stream(self, final_text: str | None = None, message_id: int | None = None) -> None:
+        """Завершить потоковый ответ и перерисовать накопленный текст как Markdown."""
+        stream = self._stream
+        self._stream = None
+        if stream is None:
+            return
+        number = stream["number"]
+        text = stream["text"] if final_text is None else str(final_text)
+        self._raw[number] = text
+        start = f"__chat_stream_{number}_s"
+        end = f"__chat_stream_{number}_e"
+        self._begin_write()
+        try:
+            self.text.delete(start, end)
+            self.text.mark_set(end, self.text.index(start))
+            self.text.mark_gravity(end, "right")
+            for tag, piece in markdown.parse(text):
+                tags = ("body", *tag.split()) if tag else ("body",)
+                self.text.insert(end, piece, tags)
+            self.text.mark_gravity(end, "left")
+            if message_id is not None and stream.get("start") is not None:
+                self._tag_message(number, stream["start"], message_id, text)
+        except tk.TclError:
+            pass
+        self._end_write()
+        if self._pending_reasoning:
+            pending, self._pending_reasoning = self._pending_reasoning, ""
+            self.add_reasoning(pending)
+
+    def _tag_message(self, number: int, start_index: str, message_id: int, text: str) -> None:
+        message_tag = f"__chat_message_{number}"
+        self._card_tags.append(message_tag)
+        self.text.tag_add(message_tag, start_index, "end-1c")
+        for event in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            self.text.tag_bind(
+                message_tag,
+                event,
+                lambda e, mid=int(message_id), value=text:
+                    self._show_message_menu(e, "assistant", mid, value),
+            )
+        self._hover_link(message_tag)
+
     def _show_message_menu(self, event, role: str, message_id: int, text: str):
         if self.text.tag_ranges("sel"):
             return "break"
@@ -424,10 +516,12 @@ class ChatView(tk.Frame):
 
         self._mark(names["bd_s"])
         self._put(body, body_tag)
-        self._mark(names["bd_e"])
-        self._put("\n", body_tag)
+        self._mark(names["bd_e"], gravity="right")
+        if body:
+            self._put("\n", body_tag)
 
         record: dict[str, Any] = {
+            "kind": kind,
             "name": tool_name, "args": tool_args, "head_tag": head_tag, "body_tag": body_tag,
             "status_tag": status_tag, "expanded": False, **names,
         }
@@ -451,13 +545,80 @@ class ChatView(tk.Frame):
             self.text.tag_configure(record["body_tag"], elide=not expanded)
             self._replace_marked_text(record["arrow_s"], record["arrow_e"], "▾ " if expanded else "▸ ",
                                       record["head_tag"], "arrow")
+            if record.get("kind") == "reasoning":
+                self._replace_marked_text(record["st_s"], record["st_e"],
+                                          "свернуть" if expanded else "развернуть",
+                                          record["head_tag"], record["status_tag"])
             self.text.configure(state="disabled")
         except tk.TclError:
             return
         self._schedule_view_restore()
 
     def add_reasoning(self, text: str) -> None:
-        self._append_expandable("reasoning", "Рассуждения модели", "", clip(text, 8000), status="развернуть")
+        record = self._append_expandable("reasoning", "Рассуждения модели", "", clip(text, 20000),
+                                         status="развернуть")
+        self._set_expanded(record, True)
+
+    # ------------------------------ потоковые рассуждения ------------------------------
+
+    @property
+    def reasoning_streaming(self) -> bool:
+        return self._reasoning is not None
+
+    def push_reasoning(self, text: str) -> None:
+        """Дописать кусок рассуждений в живую карточку (создаёт её при необходимости)."""
+        if not text:
+            return
+        if self._reasoning is None:
+            record = self._append_expandable("reasoning", "Рассуждения модели", "", "", status="думает…")
+            self._reasoning = record
+            self._reasoning_chars = 0
+            self._set_expanded(record, True)
+        record = self._reasoning
+        room = 20000 - self._reasoning_chars
+        if room <= 0:
+            return
+        piece = text[:room]
+        self._begin_write()
+        try:
+            self.text.insert(record["bd_e"], piece, record["body_tag"])
+        except tk.TclError:
+            pass
+        self._end_write()
+        self._reasoning_chars += len(piece)
+
+    def finish_reasoning(self, text: str | None = None) -> None:
+        """Завершить живую карточку рассуждений или показать её из готового ответа."""
+        if self._reasoning is None:
+            if text:
+                # Рассуждения пришли только в финальном ответе, а поток ответа уже идёт:
+                # отложим карточку до завершения потока, иначе метки потока «проглотят» её.
+                if self.streaming:
+                    self._pending_reasoning += text
+                else:
+                    self.add_reasoning(text)
+            return
+        if text and self._reasoning_chars == 0:
+            room = 20000
+            self._begin_write()
+            try:
+                self.text.insert(self._reasoning["bd_e"], text[:room], self._reasoning["body_tag"])
+            except tk.TclError:
+                pass
+            self._end_write()
+            self._reasoning_chars = min(len(text), room)
+        record = self._reasoning
+        self._reasoning = None
+        try:
+            self.text.configure(state="normal")
+            if self._reasoning_chars:
+                self.text.insert(record["bd_e"], "\n", record["body_tag"])
+            self._replace_marked_text(record["st_s"], record["st_e"], "свернуть",
+                                      record["head_tag"], record["status_tag"])
+            self.text.configure(state="disabled")
+        except tk.TclError:
+            pass
+        self._schedule_view_restore()
 
     def add_tool_call(self, name: str, args: Any):
         record = self._append_expandable(
@@ -538,6 +699,10 @@ class ChatView(tk.Frame):
         self._raw.clear()
         self._has_content = False
         self.welcome_visible = False
+        self._stream = None
+        self._reasoning = None
+        self._reasoning_chars = 0
+        self._pending_reasoning = ""
         self._pending_tools.clear()
         self._tool_records.clear()
         self._counter = 0

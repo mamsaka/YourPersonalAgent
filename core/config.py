@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,9 @@ GENERATED_TOOLS_DIR = ROOT / "tools" / "generated"
 BACKUPS_DIR = APP_DATA / "backups"
 ENV_FILE = ROOT / ".env"
 UI_SETTINGS_FILE = APP_DATA / "ui_settings.json"
+
+# WxH  или  WxH+X+Y (позиция может быть отрицательной — второй монитор).
+_GEOMETRY_RE = re.compile(r"^\d+x\d+([+-]\d+[+-]\d+)?$")
 
 for _path in (APP_DATA, WORKSPACE, SKILLS_DIR, GENERATED_TOOLS_DIR, BACKUPS_DIR):
     _path.mkdir(parents=True, exist_ok=True)
@@ -68,6 +72,25 @@ def _bool_setting(env: dict[str, str], name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _int_or_none(value: str) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def env_has(name: str) -> bool:
+    """Задан ли ключ в окружении или в .env (для разовой миграции старых настроек)."""
+    if os.getenv(name) is not None:
+        return True
+    return name in _read_env_file()
+
+
+def is_valid_geometry(value: str) -> bool:
+    """Проверить строку геометрии окна вида WxH или WxH+X+Y."""
+    return bool(_GEOMETRY_RE.match((value or "").strip()))
+
+
 @dataclass
 class AgentConfig:
     model: str = "nvidia/nemotron-3.5-super-vl:free"
@@ -78,7 +101,12 @@ class AgentConfig:
     max_tokens: int = 8192
     verify_ssl: bool = True
     confirm_dangerous: bool = True
+    stream: bool = True
+    theme: str = "dark"
     api_key: str = ""
+    # Последняя активная сессия и геометрия окна (сохраняются автоматически в .env).
+    last_session: int | None = None
+    window_geometry: str = ""
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -93,10 +121,48 @@ class AgentConfig:
             max_tokens=_int_setting(env, "OPENROUTER_MAX_TOKENS", cls.max_tokens),
             verify_ssl=_bool_setting(env, "OPENROUTER_VERIFY_SSL", True),
             confirm_dangerous=_bool_setting(env, "AGENT_CONFIRM_DANGEROUS", True),
+            stream=_bool_setting(env, "OPENROUTER_STREAM", True),
+            theme=_setting(env, "AGENT_THEME", cls.theme),
             api_key=_setting(env, "OPENROUTER_API_KEY", ""),
+            last_session=_int_or_none(_setting(env, "AGENT_LAST_SESSION", "")),
+            window_geometry=_setting(env, "AGENT_WINDOW_GEOMETRY", ""),
         )
 
     def save_api_key(self, api_key: str) -> None:
         """Сохранить API ключ в .env рядом с проектом."""
         self.api_key = api_key.strip()
         _write_env_file({"OPENROUTER_API_KEY": self.api_key})
+
+    def save_model(self, model: str) -> None:
+        """Запомнить последнюю выбранную модель в .env."""
+        model = model.strip()
+        if not model:
+            return
+        self.model = model
+        _write_env_file({"OPENROUTER_MODEL": model})
+
+    def save_last_session(self, session_id: int) -> None:
+        """Запомнить последний активный чат в .env."""
+        self.last_session = int(session_id)
+        _write_env_file({"AGENT_LAST_SESSION": str(int(session_id))})
+
+    def save_theme(self, name: str) -> None:
+        """Запомнить выбранную тему в .env."""
+        name = name.strip().lower()
+        if name not in ("dark", "light"):
+            return
+        self.theme = name
+        _write_env_file({"AGENT_THEME": name})
+
+    def save_confirm(self, value: bool) -> None:
+        """Запомнить переключатель подтверждений в .env."""
+        self.confirm_dangerous = bool(value)
+        _write_env_file({"AGENT_CONFIRM_DANGEROUS": "true" if self.confirm_dangerous else "false"})
+
+    def save_window_geometry(self, geometry: str) -> None:
+        """Запомнить размер и позицию окна в .env."""
+        geometry = geometry.strip()
+        if not is_valid_geometry(geometry):
+            return
+        self.window_geometry = geometry
+        _write_env_file({"AGENT_WINDOW_GEOMETRY": geometry})

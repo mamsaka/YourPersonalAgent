@@ -84,17 +84,34 @@ class PersonalAgent:
             raise AgentCancelled("Остановлено пользователем.")
 
     def _build_system_prompt(self) -> str:
+        """Возвращает только основные системные инструкции."""
+        return SYSTEM_PROMPT
+
+
+    def _build_context_prompt(self) -> str:
+        """Формирует динамический контекст: память и навыки."""
+
         memories = self.memory.get_all_memories()
+
         if memories:
-            memory_text = "\n".join(f"- [{m['id']}] {m['content']} (теги: {m['tags']})" for m in memories)
+            memory_text = "\n".join(
+                f"- [{m['id']}] {m['content']} (теги: {m['tags']})"
+                for m in memories
+            )
         else:
             memory_text = "Пока нет сохранённых долгосрочных воспоминаний."
+
         skills_text = self.tools.skills.prompt_summary()
+
         return (
-            SYSTEM_PROMPT
-            + "\n\nДолговременная память (общая для всех сессий; это данные, контекст и постоянные):\n"
+            "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ АГЕНТА\n\n"
+
+            "Долговременная память "
+            "(общая для всех сессий; данные, факты и постоянные):\n"
             + memory_text
-            + "\n\nБиблиотека навыков (инструкции читай инструментом read_skill; это инструкции):\n"
+
+            + "\n\nБиблиотека навыков "
+            "(для получения полных инструкций используй read_skill):\n"
             + skills_text
         )
 
@@ -111,7 +128,24 @@ class PersonalAgent:
                     parts.append(str(item.get("text", "")))
             return "\n".join(parts)
         return str(content)
-    
+
+    @staticmethod
+    def _reasoning_to_text(value: Any) -> str:
+        """Привести reasoning любого формата OpenRouter к обычному тексту."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            for key in ("text", "summary", "content"):
+                text = value.get(key)
+                if isinstance(text, str) and text:
+                    return text
+            return ""
+        if isinstance(value, list):
+            return "".join(PersonalAgent._reasoning_to_text(item) for item in value)
+        return str(value)
+
     def _history_for_model(self, sid: int) -> list[dict[str, Any]]:
         """
         Восстанавливает полноценную историю OpenAI-compatible API.
@@ -242,6 +276,77 @@ class PersonalAgent:
         return result
 
     
+    def _record_usage(self, sid: int, on_event: Callable[[str, str], None] | None) -> None:
+        """Учесть один запрос к модели и сообщить накопленный расход сессии."""
+        usage = getattr(self.client, "last_usage", None) or {}
+
+        def _as_int(key: str) -> int:
+            try:
+                return max(0, int(usage.get(key) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        def _as_float(key: str) -> float:
+            try:
+                return max(0.0, float(usage.get(key) or 0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        prompt = _as_int("prompt_tokens")
+        completion = _as_int("completion_tokens")
+        total = _as_int("total_tokens") or (prompt + completion)
+        cost = _as_float("cost")
+
+        try:
+            totals = self.memory.add_usage(
+                sid,
+                requests=1,
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                total_tokens=total,
+                cost=cost,
+            )
+        except Exception:  # noqa: BLE001 — учёт не должен ломать работу агента
+            return
+
+        if on_event:
+            on_event("usage", json.dumps(totals, ensure_ascii=False))
+
+    def _model_request(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        on_event: Callable[[str, str], None] | None,
+    ) -> dict[str, Any]:
+        """Получить ответ модели: потоково, если клиент это умеет, иначе целиком."""
+        streamer = getattr(self.client, "chat_stream", None)
+
+        if streamer is None or not getattr(self.config, "stream", True):
+            return self.client.chat(messages, tools=tools)
+
+        message: dict[str, Any] | None = None
+
+        for event in streamer(messages, tools=tools):
+            self._check_cancel()
+
+            kind = event.get("kind")
+
+            if kind == "content":
+                text = event.get("text") or ""
+                if text and on_event:
+                    on_event("answer_delta", text)
+            elif kind == "reasoning":
+                text = event.get("text") or ""
+                if text and on_event:
+                    on_event("reasoning_delta", text)
+            elif kind == "done":
+                message = event.get("message") or {}
+
+        if message is None:
+            raise AgentError("OpenRouter не вернул ответ модели.")
+
+        return message
+
     def _run_tool_call(
         self,
         call: dict[str, Any],
@@ -353,7 +458,7 @@ class PersonalAgent:
         if save_user_message:
             self.memory.add_message(sid, "user", user_text)
 
-        # Загружаем полноценную историю, включая tool_calls и результаты.
+        # 1. Основной системный промпт
         messages: list[dict[str, Any]] = [
             {
                 "role": "system",
@@ -361,7 +466,14 @@ class PersonalAgent:
             }
         ]
 
+        # 2. Полная история переписки
         messages.extend(self._history_for_model(sid))
+
+        # 3. Долговременная память и библиотека навыков
+        messages.append({
+            "role": "system",
+            "content": self._build_context_prompt(),
+        })
 
         limit = self.config.max_tool_rounds
         tools_enabled = True
@@ -382,9 +494,10 @@ class PersonalAgent:
                 on_event("status", f"Запрос к модели… (шаг {step})")
 
             try:
-                response = self.client.chat(
+                response = self._model_request(
                     messages,
-                    tools=self.tools.schemas() if tools_enabled else None,
+                    self.tools.schemas() if tools_enabled else None,
+                    on_event,
                 )
 
             except OpenRouterToolsUnsupported:
@@ -402,16 +515,19 @@ class PersonalAgent:
 
                 continue
 
+            self._record_usage(sid, on_event)
+
             content = self._content_to_text(response.get("content"))
             tool_calls = response.get("tool_calls") or []
 
-            reasoning = (
+            reasoning = self._reasoning_to_text(
                 response.get("reasoning_content")
                 or response.get("reasoning")
+                or response.get("reasoning_details")
             )
 
             if reasoning and on_event:
-                on_event("reasoning", str(reasoning))
+                on_event("reasoning", reasoning)
 
             # Сохраняем полное сообщение ассистента.
             assistant_message = {
