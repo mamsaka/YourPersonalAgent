@@ -104,6 +104,8 @@ class AgentConfig:
     stream: bool = True
     theme: str = "dark"
     api_key: str = ""
+    # Характер агента (добавляется в системный промпт). Пусто — нейтральное поведение.
+    persona: str = ""
     # Последняя активная сессия и геометрия окна (сохраняются автоматически в .env).
     last_session: int | None = None
     window_geometry: str = ""
@@ -124,6 +126,7 @@ class AgentConfig:
             stream=_bool_setting(env, "OPENROUTER_STREAM", True),
             theme=_setting(env, "AGENT_THEME", cls.theme),
             api_key=_setting(env, "OPENROUTER_API_KEY", ""),
+            persona=_setting(env, "AGENT_PERSONA", ""),
             last_session=_int_or_none(_setting(env, "AGENT_LAST_SESSION", "")),
             window_geometry=_setting(env, "AGENT_WINDOW_GEOMETRY", ""),
         )
@@ -166,3 +169,10 @@ class AgentConfig:
             return
         self.window_geometry = geometry
         _write_env_file({"AGENT_WINDOW_GEOMETRY": geometry})
+
+    def save_persona(self, persona: str) -> None:
+        """Запомнить характер агента в .env. Пустая строка сбрасывает характер."""
+        # Многострочный характер храним в одну строку: \n экранируем.
+        flat = " ".join(persona.split()).strip()
+        self.persona = flat
+        _write_env_file({"AGENT_PERSONA": flat})

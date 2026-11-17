@@ -8,6 +8,8 @@ from typing import Any, Callable
 from .theme import Theme
 from .widgets import (FlatButton, ReadOnlyText, Switch, clip, format_arguments, make_entry)
 
+from core.agent import PERSONAS, PERSONA_MAX_CHARS
+
 
 class Dialog(tk.Toplevel):
     """Базовое окно: тема, центрирование относительно главного окна, Esc для закрытия."""
@@ -193,7 +195,137 @@ class TextViewer(Dialog):
         self.copy_btn.set_text("Скопировано ✓")
 
 
+class PersonaDialog(Dialog):
+    """Выбор характера агента: готовые заготовки или собственный текст."""
+
+    CUSTOM = "Свой вариант"
+
+    def __init__(self, parent, theme: Theme, personas: dict[str, tuple[str, str]], current: str,
+                 on_save: Callable[[str], None]):
+        super().__init__(parent, theme, "Характер агента", 640, 620, modal=True, resizable=False)
+        c = theme.c
+        self._personas = personas
+        self._on_save = on_save
+        self._current = " ".join(str(current or "").split()).strip()
+
+        wrap = tk.Frame(self, bg=c["panel"])
+        wrap.pack(fill="both", expand=True, padx=26, pady=20)
+        _label(wrap, theme, "Характер агента", "title").pack(anchor="w", pady=(0, 4))
+        tk.Label(wrap, text="Задаёт стиль общения модели. Правила безопасности и точность фактов он не меняет.",
+                 bg=c["panel"], fg=c["muted"], font=theme.font_small, wraplength=theme.px(560),
+                 justify="left").pack(anchor="w")
+
+        tk.Frame(wrap, bg=c["border"], height=1).pack(fill="x", pady=14)
+
+        _label(wrap, theme, "ГОТОВЫЕ", "section").pack(anchor="w")
+        self.choice = tk.StringVar(value=self._detect_choice())
+        grid = tk.Frame(wrap, bg=c["panel"])
+        grid.pack(fill="x", pady=(8, 0))
+        for index, (key, (name, desc)) in enumerate(personas.items()):
+            row = tk.Frame(grid, bg=c["panel"])
+            row.grid(row=index, column=0, sticky="ew", pady=2)
+            grid.grid_columnconfigure(0, weight=1)
+            tk.Radiobutton(
+                row, text=name, value=key, variable=self.choice, command=self._on_choice,
+                bg=c["panel"], fg=c["text"], activebackground=c["panel"], activeforeground=c["text"],
+                selectcolor=c["card"], font=theme.font_ui_bold, anchor="w", highlightthickness=0, borderwidth=0,
+            ).pack(side="left")
+            tk.Label(row, text=desc, bg=c["panel"], fg=c["muted"], font=theme.font_small, anchor="w",
+                     justify="left", wraplength=theme.px(420)).pack(side="left", padx=(10, 0))
+
+        row_custom = tk.Frame(grid, bg=c["panel"])
+        row_custom.grid(row=len(personas), column=0, sticky="ew", pady=(6, 0))
+        tk.Radiobutton(
+            row_custom, text=self.CUSTOM, value=self.CUSTOM, variable=self.choice, command=self._on_choice,
+            bg=c["panel"], fg=c["text"], activebackground=c["panel"], activeforeground=c["text"],
+            selectcolor=c["card"], font=theme.font_ui_bold, anchor="w", highlightthickness=0, borderwidth=0,
+        ).pack(side="left")
+        tk.Label(row_custom, text="Опишите характер словами ниже.", bg=c["panel"], fg=c["muted"],
+                 font=theme.font_small, anchor="w").pack(side="left", padx=(10, 0))
+
+        tk.Frame(wrap, bg=c["border"], height=1).pack(fill="x", pady=14)
+
+        head = tk.Frame(wrap, bg=c["panel"])
+        head.pack(fill="x")
+        _label(head, theme, "СВОЙ ХАРАКТЕР", "section").pack(side="left")
+        self.counter = tk.Label(head, text="", bg=c["panel"], fg=c["muted"], font=theme.font_small)
+        self.counter.pack(side="right")
+        self.text = ReadOnlyText(wrap, theme, bg=c["input_bg"], fg=c["text"], font=theme.font, height=8)
+        self.text.pack(fill="both", expand=True, pady=(6, 0))
+        self._enable_edit()
+        self.desc = tk.Label(wrap, text="Опишите стиль общения: тон, манеру, чего избегать.",
+                             bg=c["panel"], fg=c["muted"], font=theme.font_small, anchor="w",
+                             wraplength=theme.px(560), justify="left")
+        self.desc.pack(fill="x", pady=(6, 0))
+        self.text.text.bind("<KeyRelease>", lambda e: self._refresh_counter(), add="+")
+
+        buttons = tk.Frame(self, bg=c["panel"])
+        buttons.pack(side="bottom", fill="x", padx=26, pady=18)
+        FlatButton(buttons, theme, "Сохранить", self._save, kind="accent", padx=20).pack(side="right")
+        FlatButton(buttons, theme, "Сбросить", self._reset, kind="ghost", padx=16).pack(side="right", padx=(0, 8))
+        FlatButton(buttons, theme, "Отмена", self.close, kind="ghost", padx=16).pack(side="right", padx=(0, 8))
+        self._on_choice()
+        self.ready()
+
+    def _detect_choice(self) -> str:
+        if not self._current:
+            return "neutral"
+        for key, (name, desc) in self._personas.items():
+            if self._current == name or self._current == desc:
+                return key
+        # В .env может оказаться и имя, и описание; иначе это свой текст.
+        return self.CUSTOM
+
+    def _enable_edit(self) -> None:
+        self.text.text.configure(state="normal")
+        self.text.text.delete("1.0", "end")
+        self.text.text.insert("1.0", self._current)
+        self._refresh_counter()
+
+    def _choice_text(self) -> str:
+        key = self.choice.get()
+        if key == self.CUSTOM:
+            return self.text.text.get("1.0", "end-1c")
+        return self._personas.get(key, ("", ""))[1]
+
+    def _refresh_counter(self) -> None:
+        used = len(self.text.text.get("1.0", "end-1c").strip())
+        self.counter.configure(text=f"{used} / {PERSONA_MAX_CHARS}",
+                               fg=self.theme.c["danger"] if used > PERSONA_MAX_CHARS else self.theme.c["muted"])
+
+    def _on_choice(self) -> None:
+        custom = self.choice.get() == self.CUSTOM
+        try:
+            self.text.text.configure(state="normal" if custom else "disabled")
+            if not custom:
+                self.text.text.configure(state="normal")
+                self.text.text.delete("1.0", "end")
+                self.text.text.insert("1.0", self._choice_text())
+                self.text.text.configure(state="disabled")
+        except tk.TclError:
+            pass
+        self._refresh_counter()
+
+    def _reset(self) -> None:
+        self.choice.set("neutral")
+        self._current = ""
+        self._enable_edit()
+        self._on_choice()
+
+    def _save(self) -> None:
+        key = self.choice.get()
+        value = self._choice_text()
+        if key != self.CUSTOM:
+            # Для готовых характеров сохраняем название, чтобы .env читался человеком.
+            value = self._personas.get(key, ("neutral", ""))[0]
+        value = " ".join(str(value).split()).strip()[:PERSONA_MAX_CHARS]
+        self.close()
+        self._on_save(value)
+
+
 class SettingsDialog(Dialog):
+    """Окно настроек: ключ, тема, безопасность."""
+
     def __init__(self, parent, theme: Theme, *, has_key: bool, theme_name: str, confirm_enabled: bool,
                  on_save_key: Callable[[str], None], on_set_theme: Callable[[str], None],
                  on_set_confirm: Callable[[bool], None]):

@@ -12,7 +12,7 @@ from typing import Any
 
 from core import browser as browser_module
 from core import terminals as terminals_module
-from core.agent import AgentCancelled, AgentError, PersonalAgent
+from core.agent import PERSONAS, AgentCancelled, AgentError, PersonalAgent
 from core.config import APP_DATA, ENV_FILE, UI_SETTINGS_FILE, AgentConfig, env_has, is_valid_geometry
 from core.memory import MemoryStore
 from core.openrouter import OpenRouterClient, OpenRouterError
@@ -20,7 +20,7 @@ from core.tools import ConfirmRequest, ToolRegistry
 
 from . import hotkeys
 from .chat import MAX_COLUMN, ChatView
-from .dialogs import ConfirmDialog, InventoryDialog, MemoryDialog, PromptDialog, SettingsDialog
+from .dialogs import ConfirmDialog, InventoryDialog, MemoryDialog, PersonaDialog, PromptDialog, SettingsDialog
 from .settings import UiSettings
 from .theme import Theme
 from .widgets import FlatButton, Tooltip, column_padding, fit_text_height, make_entry
@@ -275,6 +275,8 @@ class AgentApp(tk.Tk):
         tk.Frame(footer, bg=c["border"], height=1).pack(fill="x", padx=4, pady=(0, 8))
         FlatButton(footer, th, "✦   Память агента", self._open_memory, kind="sidebar", anchor="w", padx=12).pack(fill="x", pady=1)
         FlatButton(footer, th, "⚒   Инструменты и навыки", self._open_inventory, kind="sidebar", anchor="w", padx=12).pack(fill="x", pady=1)
+        FlatButton(footer, th, "✎   Характер", self._open_persona, kind="sidebar", anchor="w", padx=12,
+                   tooltip="Задать стиль общения агента").pack(fill="x", pady=1)
         self.settings_btn = FlatButton(footer, th, "⚙   Настройки", self._open_settings, kind="sidebar", anchor="w", padx=12,
                                        tooltip="Ctrl+,")
         self.settings_btn.pack(fill="x", pady=1)
@@ -552,8 +554,18 @@ class AgentApp(tk.Tk):
             on_set_theme=lambda name: self._set_theme(name, reopen_settings=True), on_set_confirm=self._set_confirm,
         )
 
+    def _open_persona(self) -> None:
+        assert self.theme is not None
+        PersonaDialog(self, self.theme, PERSONAS, self.config_obj.persona, self._save_persona)
+
+    def _save_persona(self, value: str) -> None:
+        self.config_obj.save_persona(value)
+        label = value or "Нейтральный"
+        self._set_status(f"Характер: {label}", "ok")
+        if self.chat:
+            self.chat.add_message("system", f"Характер агента обновлён: {label}. Применяется со следующего запроса.")
+
     def _save_api_key(self, value: str) -> None:
-        self.config_obj.save_api_key(value)
         self.client.set_api_key(value)
         self._update_key_state()
         self._set_status("API key сохранён в .env", "ok")
